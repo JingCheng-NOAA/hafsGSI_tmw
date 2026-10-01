@@ -287,9 +287,9 @@ contains
       ifrac_sea,ifrac_lnd,ifrac_ice,ifrac_sno,itsavg, &
       izz,idomsfc,isfcr,iff10,ilone,ilate, &
       isst_hires,isst_navy,idata_type,iclr_sky,itref,idtw,idtc,itz_tr
-  use qcmod, only: qc_ssmi,qc_geocsr,qc_ssu,qc_avhrr,qc_goesimg,qc_msu,qc_irsnd,qc_amsua,qc_mhs,qc_atms
+  use qcmod, only: qc_ssmi,qc_geocsr,qc_ssu,qc_avhrr,qc_goesimg,qc_msu,qc_irsnd,qc_amsua,qc_mhs,qc_atms,qc_tms
   use crtm_interface, only: ilzen_ang2,iscan_ang2,iszen_ang2,isazi_ang2
-  use clw_mod, only: calc_clw, ret_amsua, gmi_37pol_diff
+  use clw_mod, only: calc_clw, ret_amsua, gmi_37pol_diff, calc_scat_index_tms
   use qcmod, only: igood_qc,ifail_gross_qc,ifail_interchan_qc,ifail_crtm_qc,ifail_satinfo_qc,qc_noirjaco3,ifail_cloud_qc
   use qcmod, only: ifail_crtm_nan  
   use qcmod, only: ifail_cao_qc,cao_check  
@@ -299,6 +299,7 @@ contains
   use radinfo, only: iland_det, isnow_det, iwater_det, imix_det, iice_det, &
                       iomg_det, itopo_det, isst_det,iwndspeed_det, optconv
   use qcmod, only: setup_tzr_qc,ifail_scanedge_qc,ifail_outside_range
+  use qcmod, only: ifail_tms_overall_qc,ifail_outside_range
   use qcmod, only: iasi_cads, iasing_cads, cris_cads
   use state_vectors, only: svars3d, levels, svars2d, ns3d
   use oneobmod, only: lsingleradob,obchan,oblat,oblon,oneob_type
@@ -306,6 +307,7 @@ contains
   use radiance_mod, only: rad_obs_type,radiance_obstype_search,radiance_ex_obserr,radiance_ex_biascor
   use sparsearr, only: sparr2, new, writearray, size, fullarray
   use radiance_mod, only: radiance_ex_obserr_gmi,radiance_ex_biascor_gmi
+  use radiance_mod, only: radiance_ex_obserr_tms,radiance_ex_biascor_tms
   use cads, only: cads_imager_calc
 
   use, intrinsic :: ieee_arithmetic
@@ -360,6 +362,7 @@ contains
   real(r_kind) sfc_speed,frac_sea,tpwc_obs,sgagl,tpwc_guess_retrieval
   real(r_kind) gwp,clw_obs
   real(r_kind) scat,scatp,asum
+  real(r_kind) isi,lsi !emily
   real(r_kind) dtsavg,r90,coscon,sincon
   real(r_kind) bias       
   real(r_kind) factch6    
@@ -371,7 +374,7 @@ contains
   logical cao_flag                       
   logical hirs2,msu,goessndr,hirs3,hirs4,hirs,amsua,amsub,airs,hsb,goes_img,ahi,mhs,abi
   type(sparr2) :: dhx_dx
-  logical avhrr,avhrr_navy,viirs,lextra,ssu,iasi,iasing,cris,seviri,atms
+  logical avhrr,avhrr_navy,viirs,lextra,ssu,iasi,iasing,cris,seviri,atms,tms
   logical ssmi,ssmis,amsre,amsre_low,amsre_mid,amsre_hig,amsr2,gmi,saphir
   logical :: mws
   logical ssmis_las,ssmis_uas,ssmis_env,ssmis_img
@@ -411,7 +414,7 @@ contains
   real(r_kind),dimension(nchanl):: cld_rbc_idx,cld_rbc_idx2
   real(r_kind),dimension(nchanl):: tcc         
   real(r_kind) :: ptau5deriv, ptau5derivmax
-  real(r_kind) :: clw_guess,clw_guess_retrieval,ciw_guess,rain_guess,snow_guess,clw_avg
+  real(r_kind) :: clw_guess,clw_guess_retrieval,ciw_guess,rain_guess,snow_guess,graupel_guess,clw_avg
   real(r_kind),dimension(:), allocatable :: rsqrtinv
   real(r_kind),dimension(:), allocatable :: rinvdiag
 
@@ -450,6 +453,10 @@ contains
   real(r_kind),dimension(7,nobs)   :: imager_cluster_fraction
   real(r_kind),dimension(2,7,nobs) :: imager_cluster_bt
   real(r_kind),dimension(2,nobs)   :: imager_chan_stdev, imager_model_bt
+
+! variables added for TMS
+  integer(i_kind),dimension(nchanl):: qcflag, AscDescflag !xzhang
+  logical :: tms_qcflag=.true. !xzhang
 
 ! Notations in use: for a single obs. or a single obs. type
 ! nchanl        : a known channel count of a given type obs stream
@@ -531,6 +538,7 @@ contains
   cris       = obstype == 'cris' .or. obstype == 'cris-fsr'
   seviri     = obstype == 'seviri'
   atms       = obstype == 'atms'
+  tms        = obstype == 'tms'
   saphir     = obstype == 'saphir'
   abi        = obstype == 'abi'
   mws        = obstype == 'mws'
@@ -539,7 +547,7 @@ contains
 
   microwave=amsua .or. amsub  .or. mhs .or. msu .or. hsb .or. &
             ssmi  .or. ssmis  .or. amsre .or. atms .or. mws .or. &
-            amsr2 .or. gmi  .or.  saphir
+            amsr2 .or. gmi  .or.  saphir  .or. tms 
 
   microwave_low =amsua  .or.  msu .or. ssmi .or. ssmis .or. amsre
 
@@ -911,10 +919,21 @@ contains
               if (iuse_rad(j)< -1 .or. (channel_passive(j) .and.  &
                   .not.rad_diagsave)) tnoise(jc)=r1e10
            end if
+
+!       Load tms qc flag into work array.
+        if (tms .and. tms_qcflag) then
+            qcflag(jc) = data_s(jc+nreal-12,n)
+            AscDescflag(jc) = data_s(jc+nreal-12*2,n)
+            if (qcflag(jc) == 1 ) then
+               id_qc(jc) = ifail_tms_overall_qc
+               !print*, 'tms id_qc for overall is ', id_qc
+            end if
+        end if
      
 !       Load channel data into work array.
            tb_obs(jc) = data_s(jc+nreal,n)
         end do
+
  
 
 !       Interpolate model fields to observation location, call crtm and create jacobians
@@ -923,8 +942,9 @@ contains
         tcc=zero
         total_cloud_cover=zero
         if (radmod%lcloud_fwd) then
+          !print*,'xiaoyan check radmod%lcloud_fwd) =',radmod%lcloud_fwd
           call call_crtm(obstype,dtime,data_s(:,n),nchanl,nreal,ich, &
-             tvp,qvp,qs,clw_guess,ciw_guess,rain_guess,snow_guess,prsltmp,prsitmp, &
+             tvp,qvp,qs,clw_guess,ciw_guess,rain_guess,snow_guess,graupel_guess,prsltmp,prsitmp, &
              trop5,tzbgr,dtsavg,sfc_speed, &
              tsim,emissivity,chan_level,ptau5,ts,emissivity_k, &
                 temp,wmix,jacobian,error_status,tsim_clr=tsim_clr,tcc=tcc, & 
@@ -935,7 +955,7 @@ contains
              data_s(ilzen_ang:iscan_ang, n) = data_s(ilzen_ang2:iscan_ang2, n)
              data_s(iszen_ang:isazi_ang, n) = data_s(iszen_ang2:isazi_ang2, n)
              call call_crtm(obstype,dtime,data_s(:,n),nchanl,nreal,ich, &
-                tvp,qvp,qs,clw_guess,ciw_guess,rain_guess,snow_guess,prsltmp,prsitmp, &
+                tvp,qvp,qs,clw_guess,ciw_guess,rain_guess,snow_guess,graupel_guess,prsltmp,prsitmp, &
                  trop5,tzbgr,dtsavg,sfc_speed, &
                  tsim2,emissivity2,chan_level,ptau52,ts2,emissivity_k2, &
                  temp2,wmix2,jacobian2,error_status,tsim_clr=tsim_clr2,tcc=tcc,&
@@ -958,8 +978,9 @@ contains
           total_cloud_cover = tcc(1)
           cld = total_cloud_cover
         else
+          !print*,'xiaoyan check clear or cloud =',radmod%lcloud_fwd
           call call_crtm(obstype,dtime,data_s(:,n),nchanl,nreal,ich, &
-             tvp,qvp,qs,clw_guess,ciw_guess,rain_guess,snow_guess,prsltmp,prsitmp, &
+             tvp,qvp,qs,clw_guess,ciw_guess,rain_guess,snow_guess,graupel_guess,prsltmp,prsitmp, &
              trop5,tzbgr,dtsavg,sfc_speed, &
              tsim,emissivity,chan_level,ptau5,ts,emissivity_k, &
              temp,wmix,jacobian,error_status)
@@ -969,7 +990,7 @@ contains
              data_s(ilzen_ang:iscan_ang, n) = data_s(ilzen_ang2:iscan_ang2, n)
              data_s(iszen_ang:isazi_ang, n) = data_s(iszen_ang2:isazi_ang2, n)
              call call_crtm(obstype,dtime,data_s(:,n),nchanl,nreal,ich, &
-                tvp,qvp,qs,clw_guess,ciw_guess,rain_guess,snow_guess,prsltmp,prsitmp, &
+                tvp,qvp,qs,clw_guess,ciw_guess,rain_guess,snow_guess,graupel_guess,prsltmp,prsitmp, &
                  trop5,tzbgr,dtsavg,sfc_speed, &
                  tsim2,emissivity2,chan_level,ptau52,ts2,emissivity_k2, &
                  temp2,wmix2,jacobian2,error_status)
@@ -1064,7 +1085,8 @@ contains
         gwp=zero
         tpwc_guess_retrieval=zero
         scatp=zero
-        scat=zero  
+        scat=zero
+        lsi=zero; isi=zero 
         ierrret=0
         tpwc_obs=zero
         kraintype=0
@@ -1073,7 +1095,13 @@ contains
         if(microwave .and. sea) then 
            if(radmod%lcloud_fwd .and. (amsua .or. atms .or. mws)) then
               call ret_amsua(tb_obs,nchanl,tsavg5,zasat,clw_obs,ierrret,scat=scat)
-              scatp=scat 
+              scatp=scat
+            else if (tms) then
+              call calc_scat_index_tms(tb_obs(1), tb_obs(2), tb_obs(12), ierrret, lsi, isi)
+              !if (lsi < -33.0 .or. isi < -1.0) then
+              !    
+              !end if
+
            else
               call calc_clw(nadir,tb_obs,tsim,ich,nchanl,no85GHz,amsua,ssmi,ssmis,amsre,atms, &
                    mws,amsr2,gmi,saphir,tsavg5,sfc_speed,zasat,clw_obs,tpwc_obs,gwp,kraintype,ierrret)
@@ -1095,6 +1123,11 @@ contains
                 id_qc(1:8) = ifail_cloud_qc
                 varinv(17:24)=zero
                 id_qc(17:24) = ifail_cloud_qc
+             else if (tms) then 
+                varinv(1:8)=zero
+                id_qc(1:8) = ifail_cloud_qc
+                varinv(9:12)=zero
+                id_qc(9:12) = ifail_cloud_qc
              else       
                 varinv(1:nchanl)=zero
                 id_qc(1:nchanl) = ifail_cloud_qc
@@ -1120,6 +1153,11 @@ contains
                        id_qc(1:8) = ifail_cao_qc
                        varinv(17:24)=zero
                        id_qc(17:24) = ifail_cao_qc
+                    else if (tms) then
+                       varinv(1)=zero
+                       id_qc(1) = ifail_cao_qc
+                       varinv(9:12)=zero
+                       id_qc(9:12) = ifail_cao_qc
                     else
                        varinv(1:nchanl)=zero
                        id_qc(1:nchanl) = ifail_cao_qc
@@ -1305,6 +1343,9 @@ contains
 !          end if
            else if (radmod%ex_obserr=='ex_obserr3') then
               call radiance_ex_biascor_gmi(radmod,clw_obs,clw_guess_retrieval,nchanl,cld_rbc_idx)
+           !xyz tms
+           else if (radmod%ex_obserr=='ex_obserr4') then   
+              call radiance_ex_biascor_tms(radmod,nchanl,cldeff_obs,cldeff_fg,cld_rbc_idx)
            end if
 
            if (ierrret /= 0) then
@@ -1366,6 +1407,9 @@ contains
               call radiance_ex_obserr(radmod,nchanl,clw_obs,clw_guess_retrieval,tnoise,tnoise_cld,error0)
            else if (radmod%ex_obserr=='ex_obserr3') then
               call radiance_ex_obserr_gmi(radmod,nchanl,clw_obs,clw_guess_retrieval,tnoise,tnoise_cld,error0) 
+           else if (radmod%ex_obserr=='ex_obserr4') then
+              !call radiance_ex_obserr_tms(radmod,nchanl,clw_obs,clw_guess_retrieval,tnoise,tnoise_cld,error0) 
+              call radiance_ex_obserr_tms(radmod,nchanl,cldeff_obs,cldeff_fg,tnoise,tnoise_cld,error0) 
            end if
         end if
 
@@ -1502,6 +1546,19 @@ contains
               zsges,cenlat,tb_obsbc1,cosza,clw_obs,tbc,ptau5,emissivity_k,ts, & 
               pred,predchan,id_qc,aivals,errf,errf0,clw_obs,varinv,cldeff_obs,cldeff_fg,factch6, &
               cld_rbc_idx,sfc_speed,error0,clw_guess_retrieval,scatp,radmod)                   
+
+!>>emily
+!  ---------- TMS -------------------
+!       QC TMS data
+
+        else if (tms) then
+
+           call qc_tms(nchanl,is,ndat,nsig,npred,sea,land,ice,snow,mixed,luse(n),   &
+                       zsges,cenlat,tbc,ptau5,emissivity_k,ts, &
+                       pred,predchan,id_qc,aivals,errf,errf0,varinv, &
+                       error0,radmod)
+!<emily
+
 
 !  ---------- GOES imager --------------
 !       GOES imager Q C
@@ -1716,6 +1773,12 @@ contains
                  else if (radmod%rtype/='amsua' .and. radmod%rtype/='atms' .and. radmod%rtype/='gmi' .and. &
                          radmod%rtype/='mws' .and. radmod%lcloud4crtm(i)>=0) then
                     errf(i) = three*errf(i)    
+                 !else if(radmod%rtype == 'tms' .and. (i <= 5 .or. i>=10) ) then
+                 !   if (radmod%lprecip) then
+                 !      errf(i) = min(2.5_r_kind*errf(i),10.0_r_kind)
+                 !   else
+                 !      errf(i) = min(three*errf(i),10.0_r_kind)
+                 !   endif
                  else 
                     errf(i) = min(three*errf(i),ermax_rad(m))
                  endif
@@ -2724,6 +2787,15 @@ contains
                  call nc_diag_metadata_to_single("clw_obs",clw_obs                         )
                  call nc_diag_metadata_to_single("clw_guess",clw_guess                       )
 
+                 call nc_diag_metadata_to_single("ciw_guess",ciw_guess                       )
+                 call nc_diag_metadata_to_single("rain_guess",rain_guess                     )
+                 call nc_diag_metadata_to_single("snow_guess",snow_guess                     )
+                 call nc_diag_metadata_to_single("graupel_guess",graupel_guess               )
+
+                 call nc_diag_metadata_to_single("lsi_obs",lsi                               )
+                 call nc_diag_metadata_to_single("isi_obs",isi                               )
+                 call nc_diag_metadata_to_single("cld_rbc_idx",cld_rbc_idx(i)                )
+
                  if (nstinfo==0) then
                     data_s(itref,n)  = missing
                     data_s(idtw,n)   = missing
@@ -2736,11 +2808,18 @@ contains
                  call nc_diag_metadata_to_single("SST_Cool_layer_tdrop",data_s(idtc,n)                )       ! dt_cool at zob
                  call nc_diag_metadata_to_single("SST_dTz_dTfound",data_s(itz_tr,n)              )       ! d(Tz)/d(Tr)
 
+                 if (tms .and. tms_qcflag) call nc_diag_metadata("QC_Flag_TMS",qcflag(ich_diag(i))  )     ! observed brightness temperature (K)
+                 if (tms .and. tms_qcflag) call nc_diag_metadata("AscDesc_Flag_TMS",AscDescflag(ich_diag(i))  )  
                  call nc_diag_metadata_to_single("Observation",tb_obs0(ich_diag(i))  )     ! observed brightness temperature (K)
                  call nc_diag_metadata_to_single("Obs_Minus_Forecast_unadjusted",tbcnob(ich_diag(i))   )     ! observed - simulated Tb with no bias correction (K)
                  call nc_diag_metadata_to_single("Obs_Minus_Forecast_adjusted",tbc0(ich_diag(i)   )  )     ! observed - simulated Tb with bias corrrection (K)
                  errinv = sqrt(varinv0(ich_diag(i)))
                  call nc_diag_metadata_to_single("Inverse_Observation_Error",errinv           )
+                 errinv = error0(ich_diag(i))
+                 call nc_diag_metadata_to_single("Observation_Error",errinv           )
+                 call nc_diag_metadata_to_single("Obs_Cloud_Effect",cldeff_obs(ich_diag(i))           )
+                 call nc_diag_metadata_to_single("Bkg_Cloud_Effect",cldeff_fg(ich_diag(i))         )
+
                  if (save_jacobian .and. allocated(idnames)) then
                  call nc_diag_metadata_to_single("Observation_scaled",tb_obs(ich_diag(i))   )     ! observed brightness temperature (K) scaled by R^{-1/2}
                  call nc_diag_metadata_to_single("Obs_Minus_Forecast_adjusted_scaled",tbc(ich_diag(i)  )   )     ! observed - simulated Tb with bias corrrection (K) scaled by R^{-1/2}

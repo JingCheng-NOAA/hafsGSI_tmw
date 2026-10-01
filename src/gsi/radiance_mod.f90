@@ -347,7 +347,8 @@ contains
     character(10),dimension(ndat) :: rtype,rrtype,drtype
     logical print_verbose
 
-    print_verbose=.false.
+    !print_verbose=.false.
+    print_verbose=.true.   !emily
     if(verbose)print_verbose=.true.
 !   Cross-check 
     do j=1,jpch_rad
@@ -394,6 +395,7 @@ contains
 
 !   determine rads type
     drtype='other'
+!   write(6,*) 'emily checking radiance_obstype_init: ndat = ', ndat
     do i=1,ndat
        rtype(i)=dtype(i)                   !     rtype  - observation types to process
        if (index(dtype(i),'amsre') /= 0)  rtype(i)='amsre'
@@ -413,12 +415,13 @@ contains
           rtype(i) == 'ssmi'   .or. rtype(i) == 'atms'     .or.  rtype(i) == 'cris'   .or. & 
           rtype(i) == 'amsr2'  .or. rtype(i) == 'gmi'      .or.  rtype(i) == 'saphir' .or. &
           rtype(i) == 'cris-fsr' .or. rtype(i) == 'abi'    .or.  rtype(i) == 'viirs'  .or. &
-          rtype(i) == 'iasi-ng'  .or. rtype(i) == 'mws' )then
+          rtype(i) == 'iasi-ng'  .or. rtype(i) == 'mws'    .or.  rtype(i) == 'tms') then
           drtype(i)='rads'
        end if
+!   write(6,*) 'emily checking radiance_obstype_init: dtype = ', dtype(i), drtype(i)
     end do
- 
-!   Determine total rad types
+
+    !   Determine total rad types
     k=0
     k2i=0
     first=.true.
@@ -586,8 +589,8 @@ contains
           match=index(trim(obstype),trim(rad_type_info(i)%rtype)) /= 0
        end if
        if (match) then
-!         if (mype==0) write(6,*) 'radiance_obstype_search: obstype=',obstype, &
-!                                 ' rtype=',rad_type_info(i)%rtype
+         if (mype==0) write(6,*) 'radiance_obstype_search: obstype=',obstype, &
+                                 ' rtype=',rad_type_info(i)%rtype
           radmod%rtype = rad_type_info(i)%rtype
           radmod%nchannel = rad_type_info(i)%nchannel
           radmod%cld_sea_only = rad_type_info(i)%cld_sea_only
@@ -765,8 +768,18 @@ contains
 
        obs_found=.false.
        do i=1,total_rad_type
-          if (index(trim(rad_type_info(i)%rtype),trim(obsname)) /= 0) then
-             obs_found=.true.
+          ! Guard: If the match is 'tms' but the sensor must be 'tms', can not be 'atms'.
+          if (trim(obsname) == 'tms' ) then
+             if (trim(rad_type_info(i)%rtype) == trim(obsname) ) then
+                obs_found = .true.
+             end if
+          else
+             if (index(trim(rad_type_info(i)%rtype),trim(obsname)) /= 0) then
+                obs_found = .true.
+             end if
+          end if
+          if (obs_found) then
+             if (mype==0) write(6,*) 'xyz obs_found ', i, ' ', rad_type_info(i)%rtype, ' - ', obsname,' ',ex_obserr
              istr=i
              if (trim(obsloc)=='sea') rad_type_info(i)%cld_sea_only=.true.
              rad_type_info(i)%ex_obserr=ex_obserr
@@ -788,6 +801,8 @@ contains
 !            allocate space for entries from table, Obtain table contents
              tablename='obs_'//trim(obsname)
              if ( rad_type_info(i)%ex_obserr == 'ex_obserr3' ) then
+                call sensor_parameter_table(trim(tablename),lunin,rad_type_info(i)%nchannel,rad_type_info(i)%cclr,rad_type_info(i)%ccld,rad_type_info(i)%cldval1)
+             else if ( rad_type_info(i)%ex_obserr == 'ex_obserr4' ) then
                 call sensor_parameter_table(trim(tablename),lunin,rad_type_info(i)%nchannel,rad_type_info(i)%cclr,rad_type_info(i)%ccld,rad_type_info(i)%cldval1)
              else
                 call sensor_parameter_table(trim(tablename),lunin,rad_type_info(i)%nchannel,rad_type_info(i)%cclr,rad_type_info(i)%ccld)
@@ -1345,6 +1360,134 @@ contains
 
 !  end subroutine radiance_ex_biascor_3
   end subroutine radiance_ex_biascor_gmi
+
+  !subroutine radiance_ex_obserr_tms(radmod,nchanl,clw_obs,clw_guess_retrieval,tnoise,tnoise_cld,error0)
+  subroutine radiance_ex_obserr_tms(radmod,nchanl,cldeff1,cldeff2,tnoise,tnoise_cld,error0)
+!$$$  subprogram documentation block
+!                .      .    .
+! subprogram:    radiance_ex_obserr_4
+!
+!   prgrmmr:    xiaoyan zhang      org: np23                date: 2025-09-22
+!
+! abstract:  This routine include extra radiance bias correction routines.
+!
+! program history log:
+!   2015-09-20  zhu
+!   2016-10-27  zhu - add ATMS
+!
+!   input argument list:
+!
+!   output argument list:
+!
+! attributes:
+!   language: f90
+!   machine:  ibm rs/6000 sp; SGI Origin 2000; Compaq/HP
+!
+!$$$ end documentation block
+
+    use kinds, only: i_kind,r_kind
+    implicit none 
+
+    integer(i_kind),intent(in) :: nchanl
+    !real(r_kind),intent(in) :: clw_obs,clw_guess_retrieval
+    real(r_kind),dimension(nchanl),intent(in) :: cldeff1,cldeff2
+    real(r_kind),dimension(nchanl),intent(in):: tnoise,tnoise_cld
+    real(r_kind),dimension(nchanl),intent(inout) :: error0
+    type(rad_obs_type),intent(in) :: radmod
+
+    integer(i_kind) :: i 
+    !real(r_kind) :: clwavg
+    real(r_kind) :: cldeff
+    real(r_kind),dimension(nchanl) :: cclr,ccld,ccld_1,tnoise_cld_1
+
+    !temperally hardware the STD cloudy1
+    tnoise_cld_1 = (/ 23.0_r_kind, 27.0_r_kind, 19.0_r_kind, 18.0_r_kind, &
+                  40.0_r_kind, 13.0_r_kind, 2.5_r_kind, 2.5_r_kind, &
+                  53.0_r_kind, 20.0_r_kind, 20.0_r_kind, 30.0_r_kind /)
+
+    do i=1,nchanl
+       cclr(i)=radmod%cclr(i)
+       ccld(i)=radmod%ccld(i)
+       ccld_1(i)=radmod%cldval1(i)
+    end do
+
+    do i=1,nchanl
+       if (radmod%lcloud4crtm(i)<0) cycle
+       !clwavg=half*(clw_obs+clw_guess_retrieval)
+       cldeff=half*(abs(cldeff1(i))+abs(cldeff2(i)))
+       if(cldeff <= cclr(i)) then 
+          error0(i) = tnoise(i)
+       else if(cldeff > cclr(i) .and. cldeff <= ccld(i)) then 
+          !error0(i) = (tnoise(i) - tnoise_cld(i))*(ccld(i)-cldeff)/(ccld(i)-cclr(i))
+          error0(i) = tnoise(i)+(tnoise_cld(i)-tnoise(i))*(cldeff-cclr(i))/(ccld(i)-cclr(i))
+       else if(cldeff > ccld(i) .and. cldeff <= ccld_1(i)) then
+          error0(i) = tnoise_cld(i)+(tnoise_cld_1(i)-tnoise_cld(i)) * (cldeff-ccld(i))/(ccld_1(i)-ccld(i))
+       else if( cldeff > ccld_1(i)) then 
+          error0(i) = tnoise_cld_1(i)
+       endif
+    end do
+    return
+
+!  end subroutine radiance_ex_obserr_4
+  end subroutine radiance_ex_obserr_tms
+
+  subroutine radiance_ex_biascor_tms(radmod,nchanl,cldeff1,cldeff2,cld_rbc_idx)
+!$$$  subprogram documentation block
+!                .      .    .
+! subprogram:    radiance_ex_biascor_4
+!
+!   prgrmmr:    xiaoyan zhang      org: np23                date: 2026-02-27
+!
+! abstract:  This routine include extra radiance bias correction routines using
+!            cloud effect.
+!
+! program history log:
+!   2026-02-27  X.Zhang - adapted from radiance_ex_biascor_2
+!
+!   input argument list:
+!
+!   output argument list:
+!
+! attributes:
+!   language: f90
+!   machine:  ibm rs/6000 sp; SGI Origin 2000; Compaq/HP
+!
+!$$$ end documentation block
+    use kinds, only: i_kind,r_kind
+    use clw_mod, only: ret_amsua
+    implicit none
+
+    integer(i_kind)                   ,intent(in   ) :: nchanl
+    real(r_kind),dimension(nchanl)    ,intent(inout) :: cld_rbc_idx
+    real(r_kind),dimension(nchanl)    ,intent(in) :: cldeff1
+    real(r_kind),dimension(nchanl)    ,intent(in) :: cldeff2
+    type(rad_obs_type)                ,intent(in) :: radmod
+
+    integer(i_kind) :: i
+    integer(r_kind) :: sci
+    real(r_kind),dimension(nchanl) :: sci_match !sci threshold for clear-clear, cloud-cloud pixelsr
+    
+    !temperally hardware the STD cloudy1
+
+    sci_match = (/ 5.5_r_kind, 2.5_r_kind, 2.5_r_kind, 2.0_r_kind, &
+                  1.5_r_kind, 0.2_r_kind, 0.15_r_kind, 0.15_r_kind, &
+                  1.5_r_kind, 1.8_r_kind, 1.5_r_kind, 4.0_r_kind /)
+
+
+    do i=1,nchanl
+       if (radmod%lcloud4crtm(i)<0) cycle
+       sci=0.5*(abs(cldeff1(i)) + abs(cldeff2(i)))
+       !use all pixels from the higher peaking channel for Bias Correction 
+       if (i /= 6 .and. i/=7 .and. i/=8) then 
+          if (sci >  sci_match(i) ) then
+             cld_rbc_idx(i)=zero
+          end if
+       end if
+    end do
+
+    return
+
+  end subroutine radiance_ex_biascor_tms
 
 
 end module radiance_mod
